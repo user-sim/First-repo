@@ -1,0 +1,290 @@
+import numpy as np
+import scipy.linalg 
+from vpython import *
+
+# ==========================================
+# 0. 초기 설정
+# ==========================================
+print("="*40)
+print(" LQR Simulator: Final Physics Edition")
+print("="*40)
+print(" [Physical Shape Logic]:")
+print("  - High Cost/Inertia -> Flat (Pancake)")
+print("  - Low Cost/Inertia  -> Long (Rod)")
+print("-" * 40)
+
+# 초기 상태: 복합적인 에러 상황
+x_init = np.array([4.0, -2.0, 0.5]) 
+
+# 스타일
+BG_COLOR = color.white
+GRID_COLOR = vector(0.8, 0.8, 0.8)
+TEXT_COLOR = color.black
+
+COLOR_Q_BODY = vector(1.0, 0.5, 0.0)   # 주황 (Q)
+COLOR_R_BODY = vector(0.4, 0.8, 0.2)   # 연두 (R)
+COLOR_VEC_X = vector(1.0, 0.2, 0.0)    # x
+COLOR_VEC_U = vector(0.0, 0.5, 0.0)    # u
+COLOR_VEC_RES = vector(0.6, 0.0, 0.8)  # x_dot
+COLOR_GOLD = vector(1.0, 0.84, 0)      # Optimal
+
+COLOR_COST = vector(0.4, 0.8, 0.2)
+COLOR_BENEFIT = vector(1.0, 0.5, 0.0)
+COLOR_PROFIT_POS = vector(0, 0.8, 0)
+COLOR_PROFIT_NEG = vector(0.8, 0, 0)
+
+# ==========================================
+# 1. 물리 시스템 (M=800 반영)
+# ==========================================
+M = 800.0
+L = 15.0
+g = 9.81
+
+A = np.array([[0, 0, 0], [0, 0, -g/L], [0, 1, 0]])
+B = np.array([[1.0/M, 0, 1.0/M], [-1.0/(M*L), 0, -1.0/(M*L)], [0, 0, 0]])
+
+# Q: [10, 1000, 100] -> Y축(1000)이 가장 중요 -> Y축으로 가장 납작해야 함
+Q = np.diag([10.0, 1000.0, 100.0])
+
+# R: [10, 10000, 100] -> Y축(10000)이 가장 비쌈 -> Y축으로 가장 납작해야 함
+R = np.diag([10.0, 10000.0, 100.0])
+
+def solve_lqr(A, B, Q, R):
+    try:
+        P = scipy.linalg.solve_continuous_are(A, B, Q, R)
+        K = np.linalg.inv(R) @ B.T @ P
+        return K, P
+    except:
+        return np.zeros((3,3)), np.zeros((3,3))
+
+K_CALC, P_CALC = solve_lqr(A, B, Q, R)
+
+def calc_current_P_cost(A, B, Q, R, x, u):
+    x_norm_sq = np.dot(x, x)
+    if x_norm_sq < 1e-6: return 1e15
+    K_temp = -np.outer(u, x) / x_norm_sq
+    A_cl = A - B @ K_temp
+    if np.any(np.real(np.linalg.eigvals(A_cl)) >= -1e-5): 
+        return 1e15 
+    try:
+        Q_total = Q + K_temp.T @ R @ K_temp
+        P_temp = scipy.linalg.solve_continuous_lyapunov(A_cl.T, -Q_total)
+        return np.dot(x.T, np.dot(P_temp, x))
+    except:
+        return 1e15
+
+# ==========================================
+# 2. 씬 & 그래프 설정
+# ==========================================
+scene = canvas(title='<b>[ARROWS/MOUSE]: Cam | [SPACE]: Lock</b>', 
+               width=1280, height=500, background=BG_COLOR)
+scene.camera.pos = vector(14, 8, 18)
+scene.camera.axis = vector(-14, -8, -18)
+scene.autoscale = False
+
+# 그래프 1
+g1 = graph(title='<b>1. Net Profit (Maximize)</b>', 
+           xtitle='Sweep Time', ytitle='Profit', 
+           width=600, height=250, align='left', background=color.white,
+           ymin=-2e10, ymax=2e8) 
+plot_profit = gcurve(color=color.black, label="Profit")
+
+# 그래프 2
+g2 = graph(title='<b>2. Total Cost (Minimize)</b>', 
+           xtitle='Sweep Time', ytitle='Log(Cost)', 
+           width=600, height=250, align='right', background=color.white,
+           ymin=6, ymax=12)
+plot_cost_P = gcurve(color=color.red, label="Estimated Cost")
+
+def draw_grid(size=12):
+    for i in range(-size, size+1, 2):
+        curve(pos=[vector(-size,0,i), vector(size,0,i)], color=GRID_COLOR, radius=0.005)
+        curve(pos=[vector(i,0,-size), vector(i,0,size)], color=GRID_COLOR, radius=0.005)
+    arrow(pos=vector(0,0,0), axis=vector(size/2,0,0), color=color.gray(0.6), shaftwidth=0.05)
+    label(pos=vector(size/2+0.5,0,0), text="Dist (X)", color=TEXT_COLOR, box=False)
+    arrow(pos=vector(0,0,0), axis=vector(0,size/2,0), color=color.gray(0.6), shaftwidth=0.05)
+    label(pos=vector(0,size/2+0.5,0), text="AngVel (Y)", color=TEXT_COLOR, box=False)
+    arrow(pos=vector(0,0,0), axis=vector(0,0,size/2), color=color.gray(0.6), shaftwidth=0.05)
+    label(pos=vector(0,0,size/2+0.5), text="Angle (Z)", color=TEXT_COLOR, box=False)
+
+draw_grid()
+
+# ==========================================
+# 3. 강체 (Physically Correct Shapes)
+# ==========================================
+# [수정] 관성이 큰 축일수록 길이를 짧게(납작하게) 만듦 -> 회전하기 어렵게 표현
+# 공식: Length_i = Constant / (log10(Cost_i) + Offset)
+
+VIS_SCALE = 0.8
+
+# Q 강체 (Target Inertia)
+q_diag = np.diag(Q)
+# 값이 클수록(분모가 커짐) -> 길이가 짧아짐 -> 납작해짐 (물리적 정답)
+q_dims = 4.0 / (np.log10(q_diag) + 0.5) 
+Q_body = ellipsoid(pos=vector(0,0,0), 
+                   length=q_dims[0], height=q_dims[1], width=q_dims[2],  
+                   color=COLOR_Q_BODY, opacity=0.7, shininess=0.6)
+label(pos=vector(0, 2.5, 0), text="Target Inertia (Q)", color=COLOR_Q_BODY, box=True, opacity=0.8)
+
+# R 강체 (Input Constraint)
+r_diag = np.diag(R)
+r_offset = vector(-8, 0, 0)
+# 값이 클수록 납작해짐
+r_dims = 4.0 / (np.log10(r_diag) + 0.5)
+R_body = ellipsoid(pos=r_offset, 
+                   length=r_dims[0], height=r_dims[1], width=r_dims[2], 
+                   color=COLOR_R_BODY, opacity=0.5, shininess=0.6)
+label(pos=r_offset + vector(0, 1.5, 0), text="Input Constraint (R)", color=COLOR_R_BODY, box=True, opacity=0.8)
+
+# ==========================================
+# 4. 벡터 객체
+# ==========================================
+vec_x = arrow(pos=vector(0,0,0), axis=vector(*x_init), color=COLOR_VEC_X, shaftwidth=0.15)
+label_x = label(pos=vec_x.axis, text="x", height=12, box=False, color=COLOR_VEC_X)
+
+# Ax
+vec_Ax = arrow(pos=vector(0,0,0), axis=vector(0,0,0), color=color.gray(0.5), opacity=0.6, shaftwidth=0.1)
+label_Ax = label(pos=vector(0,0,0), text="Ax", height=12, box=False, color=color.gray(0.4), visible=False)
+
+# u (Input Space)
+vec_u = arrow(pos=r_offset, axis=vector(0,0,0), color=COLOR_VEC_U, shaftwidth=0.15)
+label_u = label(pos=r_offset, text="u", height=15, box=True, color=COLOR_VEC_U, visible=False)
+
+# Bu (Control Force)
+vec_Bu = arrow(pos=vector(0,0,0), axis=vector(0,0,0), color=COLOR_VEC_U, shaftwidth=0.12)
+
+# x_dot (Result)
+vec_xdot = arrow(pos=vector(0,0,0), axis=vector(0,0,0), color=COLOR_VEC_RES, shaftwidth=0.15)
+label_xdot = label(pos=vector(0,0,0), text="x_dot", height=12, box=True, color=COLOR_VEC_RES, visible=False, opacity=0.8)
+
+label_status = label(pos=vector(0, -3, 0), text="Press SPACE to Lock", height=20, color=TEXT_COLOR, box=True)
+label_k = label(pos=vector(0, -5, 0), text="", height=16, color=TEXT_COLOR, box=True, opacity=0, visible=False)
+
+# ==========================================
+# 5. 시뮬레이션 루프
+# ==========================================
+t = 0
+locked = False
+max_profit = -1e9
+best_u_sim = vector(0,0,0)
+SCALE_U = 4000.0  
+x_val = x_init.copy()
+
+CAM_SPEED_ORBIT = 0.005 
+CAM_SPEED_ZOOM = 0.2
+
+print("Simulation Ready.")
+
+while True:
+    rate(50) 
+    dt = 0.015 
+    t += dt
+
+    k = keysdown()
+    if ' ' in k:
+        locked = not locked
+        for _ in range(10): rate(60) 
+        if locked:
+            label_status.text = "<b>LOCKED: Optimal Control (Frozen)</b>"
+            label_status.color = vector(0.8, 0, 0)
+        else:
+            label_status.text = "Scanning..."
+            label_status.color = TEXT_COLOR
+            label_xdot.visible = False
+            label_Ax.visible = False
+            label_k.visible = False
+            label_u.visible = False
+
+    # Camera
+    if 'left' in k: scene.camera.rotate(angle=-CAM_SPEED_ORBIT, axis=vector(0,1,0), origin=vector(0,0,0))
+    if 'right' in k: scene.camera.rotate(angle=CAM_SPEED_ORBIT, axis=vector(0,1,0), origin=vector(0,0,0))
+    if 'up' in k: scene.camera.rotate(angle=-CAM_SPEED_ORBIT, axis=scene.camera.right, origin=vector(0,0,0))
+    if 'down' in k: scene.camera.rotate(angle=CAM_SPEED_ORBIT, axis=scene.camera.right, origin=vector(0,0,0))
+    if 'w' in k: scene.camera.pos += scene.camera.axis.norm() * CAM_SPEED_ZOOM
+    if 's' in k: scene.camera.pos -= scene.camera.axis.norm() * CAM_SPEED_ZOOM
+
+    # 1. u 벡터
+    if locked:
+        curr_u_vec = best_u_sim 
+    else:
+        sweep_amp = 1.8 * (1 + 0.3*np.sin(t * 0.3)) 
+        tmp_u_x = sweep_amp * np.cos(t * 0.8)
+        tmp_u_z = sweep_amp * np.sin(t * 0.5) * 0.3
+        tmp_u_y = sweep_amp * 0.1 * np.sin(t * 1.5) 
+        curr_u_vec = vector(tmp_u_x, tmp_u_y, tmp_u_z)
+
+    # 2. 강체 회전
+    rot_factor = 0.0 if locked else 1.0
+    spin_speed_x = np.linalg.norm(x_val) * 1.0
+    Q_body.rotate(angle=spin_speed_x * dt * rot_factor, axis=vector(*x_val))
+    
+    if mag(curr_u_vec) > 0.01:
+        speed_factor = 2.0 
+        R_body.rotate(angle=speed_factor * dt * rot_factor, axis=curr_u_vec.norm())
+
+    # 3. 물리 연산
+    u_sim = np.array([curr_u_vec.x, curr_u_vec.y, curr_u_vec.z]) * SCALE_U
+    cost_val = np.dot(u_sim.T, np.dot(R, u_sim))
+    Ax = np.dot(A, x_val)
+    Bu = np.dot(B, u_sim)
+    x_dot = Ax + Bu
+    
+    benefit_raw = -2 * np.dot(x_val.T, np.dot(Q, x_dot))
+    net_profit = (benefit_raw * 5.0) - cost_val
+
+    theoretical_total_cost = calc_current_P_cost(A, B, Q, R, x_val, u_sim)
+    if theoretical_total_cost > 1e14: theoretical_total_cost = 1e14
+
+    if net_profit > max_profit:
+        max_profit = net_profit
+        best_u_sim = vector(curr_u_vec.x, curr_u_vec.y, curr_u_vec.z) 
+
+    # 4. 그래프
+    if not locked:
+        plot_profit.plot(pos=(t, net_profit))
+        safe_log_cost = np.log10(theoretical_total_cost + 1)
+        plot_cost_P.plot(pos=(t, safe_log_cost))
+
+    # 5. 시각화
+    vis_u_vec = curr_u_vec.norm() * 4.5 
+    vec_u.axis = vis_u_vec
+    
+    if locked:
+        vec_u.shaftwidth = 0.3 
+        vec_u.color = COLOR_GOLD
+        label_u.visible = True
+        label_u.text = "Optimal u*"
+        label_u.pos = r_offset + vis_u_vec + vector(0, 0.5, 0)
+        label_u.color = COLOR_GOLD
+    else:
+        vec_u.color = COLOR_VEC_U
+        vec_u.shaftwidth = 0.15
+
+    VIS_PHYSICS_SCALE = 1.0
+    phys_Bu = vector(*Bu)
+    vec_Bu.axis = phys_Bu * VIS_PHYSICS_SCALE
+    
+    vec_Ax.axis = vector(*Ax) * VIS_PHYSICS_SCALE
+    vec_xdot.pos = vector(0,0,0)
+    vec_xdot.axis = (vector(*Ax) + phys_Bu) * VIS_PHYSICS_SCALE
+    
+    if locked: 
+        label_xdot.visible = True
+        label_xdot.pos = vec_xdot.axis 
+        label_Ax.visible = True
+        label_Ax.pos = vec_Ax.axis 
+        
+        vec_Bu.opacity = 1.0
+        vec_Bu.color = COLOR_GOLD
+        
+        k_text = "Calculated Optimal K:\n"
+        row1 = f"[{K_CALC[0,0]:.2f}, {K_CALC[0,1]:.2f}, {K_CALC[0,2]:.2f}]"
+        row2 = f"[{K_CALC[1,0]:.2f}, {K_CALC[1,1]:.2f}, {K_CALC[1,2]:.2f}]"
+        row3 = f"[{K_CALC[2,0]:.2f}, {K_CALC[2,1]:.2f}, {K_CALC[2,2]:.2f}]"
+        label_k.text = k_text + row1 + "\n..."
+        label_k.visible = True
+        label_k.opacity = 1.0
+    else:
+        label_Ax.visible = False
+        vec_Bu.opacity = 0.6
+        vec_Bu.color = COLOR_VEC_U
